@@ -1,4 +1,4 @@
-// Swarmleash backend: Bybit testnet market data, a four-agent swarm and guarded orders over a small JSON API.
+// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard and guarded orders over a small JSON API.
 // Keys live here (env), never in the glasses app. Testnet/paper only.
 // Run with: node server.ts  (Node 22.18+ strips the types natively)
 import http from 'node:http';
@@ -83,8 +83,21 @@ function propose(symbol: Pair, m: Market): Omit<Proposal, 'tilt' | 'mode'> {
     summary: side ? `${side === 'Buy' ? 'LONG' : 'SHORT'} ${symbol.replace('USDT', '')} ${qty}` : 'No trade: swarm split' };
 }
 
+// ---------- Tilt Guard ----------
+function tilt(m: Market): string[] {
+  const recent = state.orders.filter(o => Date.now() - o.ts < 5 * 60e3);
+  const e = state.lastEntry;
+  const lostLast = e !== null && ((e.side === 'Buy' && m.price < e.price) || (e.side === 'Sell' && m.price > e.price));
+  const reasons: string[] = [];
+  if (recent.length >= 3) reasons.push(`${recent.length} orders in 5 min`);
+  if (e && lostLast && Date.now() - e.ts < 3 * 60e3) reasons.push('last trade is red');
+  if (state.tiltForced) reasons.push('demo tilt');
+  return reasons;
+}
+
 // ---------- guarded orders ----------
-const state: { orders: (OrderRequest & { ts: number })[] } = { orders: [] };
+interface Entry { side: Side; price: number; ts: number }
+const state: { orders: (OrderRequest & { ts: number })[]; lastEntry: Entry | null; tiltForced: boolean } = { orders: [], lastEntry: null, tiltForced: false };
 
 async function bybitOrder(o: Pick<OrderRequest, 'symbol' | 'side' | 'qty'>): Promise<{ retCode: number; retMsg: string }> {
   if (!KEY || !SECRET) throw new Error('Bybit keys not set');
@@ -100,8 +113,10 @@ async function executeOrder(o: OrderRequest): Promise<OrderResult> {
   const cap = MAX_QTY[o.symbol];
   if (!['Buy', 'Sell'].includes(o.side) || !(o.qty > 0) || o.qty > cap) return { ok: false, status: 400, error: `size cap ${cap}` };
   const m = await market(o.symbol);
+  if (tilt(m).length && !o.calm) return { ok: false, status: 409, error: 'tilt guard: confirm calm' };
   const r = LIVE_ORDERS ? await bybitOrder(o) : { retCode: 0, retMsg: 'paper fill' };
-  state.orders.push({ ts: Date.now(), ...o });
+  state.orders.push({ ts: Date.now(), ...o }); state.lastEntry = { side: o.side, price: m.price, ts: Date.now() };
+  state.tiltForced = false;
   return { ok: r.retCode === 0, mode: MODE, fillPrice: m.price, msg: r.retMsg };
 }
 
@@ -124,12 +139,13 @@ http.createServer(async (req, res) => {
       const q = url.searchParams.get('symbol');
       const symbol: Pair = isPair(q) ? q : 'ETHUSDT';
       const m = await market(symbol);
-      return send(res, 200, { ...propose(symbol, m), tilt: [], mode: MODE } satisfies Proposal);
+      return send(res, 200, { ...propose(symbol, m), tilt: tilt(m), mode: MODE } satisfies Proposal);
     }
     if (url.pathname === '/api/order' && req.method === 'POST') {
       const r = await executeOrder(await readJson<OrderRequest>(req));
       return send(res, r.status || 200, r);
     }
+    if (url.pathname === '/api/tilt') { state.tiltForced = true; return send(res, 200, { ok: true }); } // demo helper
     send(res, 404, { error: 'not found' });
   } catch (e) { send(res, 500, { error: errMsg(e) }); }
 }).listen(PORT, () => console.log(`swarmleash backend :${PORT} (${LIVE_ORDERS ? 'Bybit testnet orders' : 'paper orders'})`));
