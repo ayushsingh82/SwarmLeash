@@ -1,10 +1,10 @@
-// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal, the pre-mortem, cross-venue funding, exit plans and guarded orders over a small JSON API.
+// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal, the pre-mortem, cross-venue funding, exit plans, positions with P&L and guarded orders over a small JSON API.
 // Keys live here (env), never in the glasses app. Testnet/paper only.
 // Run with: node server.ts  (Node 22.18+ strips the types natively)
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import type { AgentVote, Challenge, JournalEntry, JournalResponse, Mode, OrderRequest, OrderResult, Pair, PreMortem, Proposal, Side, Support, TagStat, Verdict, VenueRate } from './src/types.ts';
+import type { AgentVote, Challenge, EdgeReport, ExitReason, JournalEntry, JournalResponse, Mode, OrderRequest, OrderResult, Pair, Position, PositionsResponse, PreMortem, Proposal, Side, Support, TagStat, Verdict, VenueRate } from './src/types.ts';
 
 // ---------- env ----------
 try {
@@ -146,6 +146,66 @@ function journalStats(): TagStat[] {
   }
   return Object.values(by).sort((a, b) => b.n - a.n);
 }
+// ---------- positions: open trades marked to market, closed for real P&L ----------
+const priceCache = new Map<Pair, { ts: number; px: number }>();
+async function markPrice(symbol: Pair): Promise<number> {
+  const hit = priceCache.get(symbol);
+  if (hit && Date.now() - hit.ts < 1500) return hit.px;
+  const t = await getJson<{ result: { list: { lastPrice: string }[] } }>(`${BYBIT}/v5/market/tickers?category=linear&symbol=${symbol}`);
+  const px = Number(t.result.list[0]?.lastPrice);
+  priceCache.set(symbol, { ts: Date.now(), px });
+  return px;
+}
+function pnlOf(e: JournalEntry, exit: number): { pct: number; usd: number } {
+  const dir = e.side === 'Buy' ? 1 : -1;
+  return { pct: +(dir * (exit - e.entry) / e.entry * 100).toFixed(2), usd: +(dir * (exit - e.entry) * (e.qty ?? 0)).toFixed(2) };
+}
+async function closePosition(e: JournalEntry, exit: number, reason: ExitReason, fraction = 1): Promise<JournalEntry> {
+  const full = fraction >= 0.999;
+  const qty = full ? (e.qty ?? 0) : +((e.qty ?? 0) * fraction).toFixed(6);
+  if (LIVE_ORDERS && qty > 0) await bybitOrder({ symbol: e.symbol, side: e.side === 'Buy' ? 'Sell' : 'Buy', qty }, true); // reduce-only exit on the testnet
+  const { pct, usd } = pnlOf(e, exit);
+  const done: Partial<JournalEntry> = { status: 'closed', exit, pnlPct: pct, pnlUsd: usd, win: pct > 0, exitReason: reason };
+  let closed: JournalEntry;
+  if (full) { Object.assign(e, done); closed = e; }
+  else { closed = { ...e, ...done, id: `${e.id}c${Date.now()}`, qty, status: 'closed' }; e.qty = +((e.qty ?? 0) - qty).toFixed(6); journal.push(closed); }
+  saveJournal();
+  return closed;
+}
+async function settleAuto(): Promise<void> { // an open trade that hits its stop or target closes itself
+  for (const e of journal.filter(x => x.status === 'open')) {
+    const px = await markPrice(e.symbol), buy = e.side === 'Buy';
+    if (e.stop !== undefined && (buy ? px <= e.stop : px >= e.stop)) await closePosition(e, e.stop, 'stop');
+    else if (e.target !== undefined && (buy ? px >= e.target : px <= e.target)) await closePosition(e, e.target, 'target');
+  }
+}
+async function listPositions(): Promise<PositionsResponse> {
+  await settleAuto();
+  const positions: Position[] = [];
+  for (const e of journal.filter(x => x.status === 'open' && (x.qty ?? 0) > 0)) {
+    const mark = await markPrice(e.symbol), { pct, usd } = pnlOf(e, mark);
+    positions.push({ id: e.id, symbol: e.symbol, side: e.side, qty: e.qty ?? 0, entry: e.entry, mark, pnlPct: pct, pnlUsd: usd, stop: e.stop, target: e.target, thesis: e.text, tags: e.tags, ts: e.ts });
+  }
+  return { positions, totalPnlUsd: +positions.reduce((a, p) => a + p.pnlUsd, 0).toFixed(2) };
+}
+function edgeReport(): EdgeReport {
+  const closed = journal.filter(e => e.status === 'closed');
+  const wins = closed.filter(e => e.win).length;
+  const byTag = journalStats(), rated = byTag.filter(x => x.n >= 2);
+  const rate = (x: TagStat): number => x.wins / x.n;
+  const best = [...rated].sort((a, b) => rate(b) - rate(a) || b.n - a.n)[0];
+  const worst = [...rated].sort((a, b) => rate(a) - rate(b) || b.n - a.n)[0];
+  const real = journal.filter(e => !e.seed);
+  return { trades: closed.length, wins, winRate: closed.length ? Math.round(wins / closed.length * 100) : 0,
+    totalPnlPct: +closed.reduce((a, e) => a + (e.pnlPct ?? 0), 0).toFixed(2), totalPnlUsd: +closed.reduce((a, e) => a + (e.pnlUsd ?? 0), 0).toFixed(2),
+    best, worst: worst && worst !== best ? worst : undefined, byTag, realTrades: real.length, withStop: real.filter(e => e.stop !== undefined).length };
+}
+function edgeText(r: EdgeReport): string {
+  if (!r.trades) return 'No closed trades yet. Close a position to start your edge report.';
+  const line = (x?: TagStat): string => (x ? `${x.tag} ${x.wins}/${x.n} (${Math.round(x.wins / x.n * 100)}%)` : 'not enough data');
+  return `📊 Your edge report\nWin rate ${r.winRate}% (${r.wins}/${r.trades}) · P&L ${r.totalPnlPct >= 0 ? '+' : ''}${r.totalPnlPct}%\n✅ Edge: ${line(r.best)}\n⚠️ Leak: ${line(r.worst)}\n🛡 Trades with a stop: ${r.withStop} of ${r.realTrades}`;
+}
+
 function seedJournal(): void { // demo history so the pre-mortem has something to push back with
   const base = Date.now() - 86400e3;
   const mk = (i: number, text: string, side: Side, tags: string[], win: boolean, pnl: number): JournalEntry =>
@@ -244,9 +304,9 @@ function premortem(text: string, m: Market, tiltReasons: string[], parsed?: Thes
 interface Entry { side: Side; price: number; ts: number }
 const state: { orders: (OrderRequest & { ts: number })[]; lastEntry: Entry | null; tiltForced: boolean } = { orders: [], lastEntry: null, tiltForced: false };
 
-async function bybitOrder(o: Pick<OrderRequest, 'symbol' | 'side' | 'qty'>): Promise<{ retCode: number; retMsg: string }> {
+async function bybitOrder(o: Pick<OrderRequest, 'symbol' | 'side' | 'qty'>, reduceOnly = false): Promise<{ retCode: number; retMsg: string }> {
   if (!KEY || !SECRET) throw new Error('Bybit keys not set');
-  const body = JSON.stringify({ category: 'linear', symbol: o.symbol, side: o.side, orderType: 'Market', qty: String(o.qty) });
+  const body = JSON.stringify({ category: 'linear', symbol: o.symbol, side: o.side, orderType: 'Market', qty: String(o.qty), ...(reduceOnly ? { reduceOnly: true } : {}) });
   const ts = String(Date.now()), rw = '5000';
   const sig = crypto.createHmac('sha256', SECRET).update(ts + KEY + rw + body).digest('hex');
   return getJson(`${BYBIT}/v5/order/create`, { method: 'POST', body, headers: {
@@ -298,10 +358,24 @@ http.createServer(async (req, res) => {
     if (url.pathname === '/api/premortem' && req.method === 'POST') {
       const { text } = await readJson<{ text?: string }>(req);
       if (!text || text.length > 300) return send(res, 400, { error: 'say your trade' });
-      const th = parseThesis(text), m = await market(th.symbol);
+      const th = parseThesis(text), m = await market(th.symbol); await settleAuto();
       return send(res, 200, premortem(text, m, tilt(m), th));
     }
-    if (url.pathname === '/api/journal') return send(res, 200, { entries: journal.slice(-30).reverse(), stats: journalStats() } satisfies JournalResponse);
+    if (url.pathname === '/api/positions') return send(res, 200, await listPositions());
+    if (url.pathname === '/api/position/close' && req.method === 'POST') {
+      const { id, fraction } = await readJson<{ id?: string; fraction?: number }>(req);
+      const e = journal.find(j => j.id === id && j.status === 'open');
+      if (!e) return send(res, 404, { ok: false, error: 'no such open position' });
+      const f = typeof fraction === 'number' && fraction > 0 && fraction <= 1 ? fraction : 1;
+      const closed = await closePosition(e, await markPrice(e.symbol), f < 0.999 ? 'cut' : 'manual', f);
+      return send(res, 200, { ok: true, closed });
+    }
+    if (url.pathname === '/api/edge') return send(res, 200, edgeReport());
+    if (url.pathname === '/api/status') return send(res, 200, { bybit: LIVE_ORDERS, orders5m: state.orders.filter(o => Date.now() - o.ts < 3e5).length });
+    if (url.pathname === '/api/journal') {
+      await settleAuto();
+      return send(res, 200, { entries: journal.slice(-30).reverse(), stats: journalStats() } satisfies JournalResponse);
+    }
     if (url.pathname === '/api/journal/seed' && req.method === 'POST') { seedJournal(); return send(res, 200, { ok: true, stats: journalStats() }); }
     if (url.pathname === '/api/tilt') { state.tiltForced = true; return send(res, 200, { ok: true }); } // demo helper
     send(res, 404, { error: 'not found' });
