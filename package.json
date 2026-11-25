@@ -1,0 +1,26 @@
+{
+  "name": "swarmleash",
+  "version": "1.0.0",
+  "description": "Swarmleash: say your trade, a swarm argues back. Pre-mortem for traders on Even G2 smart glasses.",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "server": "node server.ts",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "pack": "npm run build && evenhub pack app.json dist -o swarmleash.ehpk"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@evenrealities/even_hub_sdk": "^0.0.16"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.7",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  },
+  "private": true
+}
