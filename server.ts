@@ -1,10 +1,10 @@
-// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard and guarded orders over a small JSON API.
+// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal and guarded orders over a small JSON API.
 // Keys live here (env), never in the glasses app. Testnet/paper only.
 // Run with: node server.ts  (Node 22.18+ strips the types natively)
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import type { AgentVote, Mode, OrderRequest, OrderResult, Pair, Proposal, Side } from './src/types.ts';
+import type { AgentVote, JournalEntry, JournalResponse, Mode, OrderRequest, OrderResult, Pair, Proposal, Side, TagStat } from './src/types.ts';
 
 // ---------- env ----------
 try {
@@ -95,6 +95,32 @@ function tilt(m: Market): string[] {
   return reasons;
 }
 
+// ---------- journal ----------
+const JOURNAL_FILE = 'journal.json';
+let journal: JournalEntry[] = [];
+try { journal = JSON.parse(fs.readFileSync(JOURNAL_FILE, 'utf8')) as JournalEntry[]; } catch { /* first run */ }
+const saveJournal = (): void => { try { fs.writeFileSync(JOURNAL_FILE, JSON.stringify(journal, null, 1)); } catch { /* read-only fs */ } };
+
+function journalStats(): TagStat[] {
+  const by: Record<string, TagStat> = {};
+  for (const e of journal.filter(x => x.status === 'closed')) {
+    for (const t of e.tags) { const s = (by[t] ??= { tag: t, n: 0, wins: 0 }); s.n++; if (e.win) s.wins++; }
+  }
+  return Object.values(by).sort((a, b) => b.n - a.n);
+}
+function seedJournal(): void { // demo history so the pre-mortem has something to push back with
+  const base = Date.now() - 86400e3;
+  const mk = (i: number, text: string, side: Side, tags: string[], win: boolean, pnl: number): JournalEntry =>
+    ({ id: 'seed' + i, ts: base + i * 3600e3, text, symbol: 'ETHUSDT', side, tags, entry: 0, status: 'closed', win, pnlPct: pnl, seed: true });
+  journal = journal.filter(e => !e.seed).concat([
+    mk(1, 'long ETH, ETF headline', 'Buy', ['news'], false, -1.4), mk(2, 'long ETH, Fed news', 'Buy', ['news'], false, -0.9),
+    mk(3, 'long ETH on the announcement', 'Buy', ['news'], false, -2.1), mk(4, 'long ETH, rumor of listing', 'Buy', ['news'], false, -1.1),
+    mk(5, 'long ETH, breakout above resistance', 'Buy', ['breakout'], true, 1.8), mk(6, 'long ETH, clean breakout', 'Buy', ['breakout'], true, 2.2),
+    mk(7, 'short ETH, overextended', 'Sell', ['overextended'], true, 1.2), mk(8, 'long ETH, buying the dip', 'Buy', ['dip'], true, 0.8),
+    mk(9, 'long ETH, buying the dip', 'Buy', ['dip'], false, -1.0)]);
+  saveJournal();
+}
+
 // ---------- guarded orders ----------
 interface Entry { side: Side; price: number; ts: number }
 const state: { orders: (OrderRequest & { ts: number })[]; lastEntry: Entry | null; tiltForced: boolean } = { orders: [], lastEntry: null, tiltForced: false };
@@ -117,6 +143,8 @@ async function executeOrder(o: OrderRequest): Promise<OrderResult> {
   const r = LIVE_ORDERS ? await bybitOrder(o) : { retCode: 0, retMsg: 'paper fill' };
   state.orders.push({ ts: Date.now(), ...o }); state.lastEntry = { side: o.side, price: m.price, ts: Date.now() };
   state.tiltForced = false;
+  journal.push({ id: 'j' + Date.now(), ts: Date.now(), text: o.thesis || 'swarm idea', symbol: o.symbol, side: o.side, qty: o.qty, tags: o.tags?.length ? o.tags : ['swarm'], entry: m.price, status: 'open' });
+  saveJournal();
   return { ok: r.retCode === 0, mode: MODE, fillPrice: m.price, msg: r.retMsg };
 }
 
@@ -145,6 +173,8 @@ http.createServer(async (req, res) => {
       const r = await executeOrder(await readJson<OrderRequest>(req));
       return send(res, r.status || 200, r);
     }
+    if (url.pathname === '/api/journal') return send(res, 200, { entries: journal.slice(-30).reverse(), stats: journalStats() } satisfies JournalResponse);
+    if (url.pathname === '/api/journal/seed' && req.method === 'POST') { seedJournal(); return send(res, 200, { ok: true, stats: journalStats() }); }
     if (url.pathname === '/api/tilt') { state.tiltForced = true; return send(res, 200, { ok: true }); } // demo helper
     send(res, 404, { error: 'not found' });
   } catch (e) { send(res, 500, { error: errMsg(e) }); }
