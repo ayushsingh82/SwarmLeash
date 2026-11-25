@@ -1,4 +1,4 @@
-// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal, the pre-mortem, cross-venue funding and guarded orders over a small JSON API.
+// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal, the pre-mortem, cross-venue funding, exit plans and guarded orders over a small JSON API.
 // Keys live here (env), never in the glasses app. Testnet/paper only.
 // Run with: node server.ts  (Node 22.18+ strips the types natively)
 import http from 'node:http';
@@ -24,6 +24,7 @@ const MAX_QTY: Record<Pair, number> = { ETHUSDT: 0.5, BTCUSDT: 0.01, SOLUSDT: 5 
 const PAIRS = Object.keys(MAX_QTY) as Pair[];
 const isPair = (s: unknown): s is Pair => typeof s === 'string' && (PAIRS as string[]).includes(s);
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const num = (x: unknown): number | undefined => (typeof x === 'number' && Number.isFinite(x) && x > 0 ? x : undefined);
 
 async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   return (await fetch(url, init)).json() as Promise<T>;
@@ -159,7 +160,20 @@ function seedJournal(): void { // demo history so the pre-mortem has something t
 }
 
 // ---------- thesis parsing ----------
-interface Thesis { side: Side | null; symbol: Pair; tags: string[] }
+interface Level { value: number; pct: boolean }
+interface Thesis { side: Side | null; symbol: Pair; tags: string[]; stop?: Level; target?: Level }
+const NUM = String.raw`\$?\s*(\d[\d,]*(?:\.\d+)?)\s*(%|percent|k)?`;
+const STOP_RE = new RegExp(String.raw`\b(?:stop(?:\s*loss)?|sl|wrong\s+(?:below|above|under|over)|invalidat\w*(?:\s+(?:below|above|under|over))?|out\s+(?:at|below|above))\s*(?:at|is|of|@|:|=)?\s*` + NUM, 'i');
+const TARGET_RE = new RegExp(String.raw`\b(?:target|tp|take\s+profit|goal)\s*(?:at|is|of|@|:|=)?\s*` + NUM, 'i');
+function level(text: string, re: RegExp): Level | undefined {
+  const m = text.match(re);
+  if (!m || !m[1]) return undefined;
+  let value = Number(m[1].replace(/,/g, ''));
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  const unit = (m[2] ?? '').toLowerCase();
+  if (unit === 'k') value *= 1000;
+  return { value, pct: unit === '%' || unit === 'percent' };
+}
 const TAGS: [string, RegExp][] = [['news', /news|etf|fed|headline|announce|rumou?r|cpi|report|tweet/], ['breakout', /breakout|break out|resistance|ath|all.time/],
   ['dip', /dip|bounce|oversold|cheap|discount/], ['momentum', /momentum|trend|running|pumping|ripping/], ['fomo', /fomo|everyone|missing|can'?t miss|moon/],
   ['revenge', /revenge|win it back|make it back|recover|get back/], ['overextended', /overextended|too high|top|exhausted|overbought/]];
@@ -171,7 +185,7 @@ function parseThesis(text: string): Thesis {
   const symbol: Pair = /\bbtc|bitcoin\b/.test(t) ? 'BTCUSDT' : /\bsol/.test(t) ? 'SOLUSDT' : 'ETHUSDT';
   const tags = TAGS.filter(([, re]) => re.test(t)).map(([n]) => n);
   if (!tags.length) tags.push('hunch');
-  return { side, symbol, tags };
+  return { side, symbol, tags, stop: level(text, STOP_RE), target: level(text, TARGET_RE) };
 }
 
 // ---------- pre-mortem: the devil's advocate ----------
@@ -179,6 +193,16 @@ function premortem(text: string, m: Market, tiltReasons: string[], parsed?: Thes
   const th = parsed ?? parseThesis(text), ind = indicators(m), cap = MAX_QTY[th.symbol];
   const side = th.side, tag = th.tags[0] ?? 'hunch', hist = record(tag, side);
   const ch: Challenge[] = []; // candidate counter-arguments, strongest wins
+  // exit plan: "stop 2% target 4%" or absolute prices
+  const price = m.price, dir = side === 'Buy' ? 1 : -1;
+  const priceOf = (l: Level | undefined, kind: 'stop' | 'target'): number | undefined =>
+    !l ? undefined : l.pct ? +(price * (1 + dir * (kind === 'stop' ? -1 : 1) * l.value / 100)).toFixed(2) : l.value;
+  let stop = priceOf(th.stop, 'stop'), target = priceOf(th.target, 'target');
+  let wrongSide = false;
+  if (side && stop !== undefined && (side === 'Buy' ? stop >= price : stop <= price)) { wrongSide = true; stop = undefined; }
+  if (side && target !== undefined && (side === 'Buy' ? target <= price : target >= price)) target = undefined;
+  const stopPct = stop !== undefined ? +(Math.abs(price - stop) / price * 100).toFixed(2) : undefined;
+  const rr = stop !== undefined && target !== undefined ? +(Math.abs(target - price) / Math.abs(price - stop)).toFixed(1) : undefined;
   if (tiltReasons.length) ch.push({ kind: 'tilt', text: `You are tilting: ${tiltReasons[0]}`, strength: 0.95 });
   if (hist.n >= 2) { const rate = hist.wins / hist.n; ch.push({ kind: 'history', text: `Your ${hist.n} ${tag} trades: ${hist.wins} won`, strength: hist.n >= 3 ? Math.min(1, 0.35 + (1 - rate) * 0.65) : 0.3 * (1 - rate) }); }
   const crowdedLong = m.venues.filter(v => v.rate8h > CROWDED).length, crowdedShort = m.venues.filter(v => v.rate8h < -CROWDED).length, nv = m.venues.length;
@@ -190,7 +214,16 @@ function premortem(text: string, m: Market, tiltReasons: string[], parsed?: Thes
   if (side === 'Sell' && ind.rsi < 30) ch.push({ kind: 'rsi', text: `Oversold, RSI ${ind.rsi.toFixed(0)}`, strength: 0.65 });
   if (ind.atrPct > 0.35) ch.push({ kind: 'vol', text: `Wild market, vol ${ind.atrPct.toFixed(2)}%`, strength: 0.5 });
   if (['fomo', 'revenge'].includes(tag)) ch.push({ kind: 'bias', text: `"${tag}" is a bias, not a reason`, strength: 0.75 });
+  if (side) {
+    if (wrongSide) ch.push({ kind: 'plan', text: 'Your stop is on the wrong side of entry', strength: 0.8 });
+    else if (stop === undefined) ch.push({ kind: 'nostop', text: 'No stop: where are you wrong?', strength: 0.5 });
+    if (stopPct !== undefined && stopPct < ind.atrPct * 3) ch.push({ kind: 'plan', text: `Stop is inside the noise (${stopPct}% vs vol ${ind.atrPct.toFixed(2)}%)`, strength: 0.55 });
+    if (stopPct !== undefined && stopPct > 5) ch.push({ kind: 'plan', text: `Stop is wide (${stopPct}%): one loss hurts`, strength: 0.45 });
+    if (rr !== undefined && rr < 1) ch.push({ kind: 'plan', text: `Reward is ${rr}R: smaller than the risk`, strength: 0.55 });
+  }
   const pro: Support[] = []; // evidence that agrees with the trade, so the debate is two-sided
+  if (rr !== undefined && rr >= 2) pro.push({ kind: 'plan', text: `Good plan: ${rr}R reward for 1R risk` });
+  else if (stop !== undefined && stopPct !== undefined && stopPct >= ind.atrPct * 3) pro.push({ kind: 'plan', text: `You know where you are wrong (stop ${stop})` });
   if (side === 'Buy' && ind.fast > ind.slow) pro.push({ kind: 'trend', text: 'Trend agrees (EMA9 > EMA21)' });
   if (side === 'Sell' && ind.fast < ind.slow) pro.push({ kind: 'trend', text: 'Trend agrees (EMA9 < EMA21)' });
   if (hist.n >= 2 && hist.wins / hist.n >= 0.66) pro.push({ kind: 'history', text: `Your ${hist.n} ${tag} trades: ${hist.wins} won` });
@@ -202,7 +235,7 @@ function premortem(text: string, m: Market, tiltReasons: string[], parsed?: Thes
   const top = ch[0]?.strength ?? 0;
   const verdict: Verdict = top >= 0.7 ? 'RED' : top >= 0.4 ? 'AMBER' : 'GREEN';
   const qty = +(cap * (verdict === 'RED' ? 0.3 : 0.6)).toFixed(4);
-  return { thesis: text, symbol: th.symbol, side, tags: th.tags, qty, price: m.price, challenges: ch.slice(0, 3), support: pro.slice(0, 2), verdict,
+  return { thesis: text, symbol: th.symbol, side, tags: th.tags, qty, price: m.price, challenges: ch.slice(0, 3), support: pro.slice(0, 2), verdict, stop, target, stopPct, rr,
     venues: m.venues, history: hist, tilt: tiltReasons, series: m.closes.slice(-60), mode: MODE, ts: Date.now(),
     summary: side ? `${side === 'Buy' ? 'LONG' : 'SHORT'} ${th.symbol.replace('USDT', '')} ${qty}` : 'Say long or short' };
 }
@@ -229,7 +262,10 @@ async function executeOrder(o: OrderRequest): Promise<OrderResult> {
   const r = LIVE_ORDERS ? await bybitOrder(o) : { retCode: 0, retMsg: 'paper fill' };
   state.orders.push({ ts: Date.now(), ...o }); state.lastEntry = { side: o.side, price: m.price, ts: Date.now() };
   state.tiltForced = false;
-  journal.push({ id: 'j' + Date.now(), ts: Date.now(), text: o.thesis || 'swarm idea', symbol: o.symbol, side: o.side, qty: o.qty, tags: o.tags?.length ? o.tags : ['swarm'], entry: m.price, status: 'open' });
+  const sl = num(o.stop), tp = num(o.target);
+  const stop = sl !== undefined && (o.side === 'Buy' ? sl < m.price : sl > m.price) ? sl : undefined;
+  const target = tp !== undefined && (o.side === 'Buy' ? tp > m.price : tp < m.price) ? tp : undefined;
+  journal.push({ id: 'j' + Date.now(), ts: Date.now(), text: o.thesis || 'swarm idea', symbol: o.symbol, side: o.side, qty: o.qty, tags: o.tags?.length ? o.tags : ['swarm'], entry: m.price, status: 'open', stop, target });
   saveJournal();
   return { ok: r.retCode === 0, mode: MODE, fillPrice: m.price, msg: r.retMsg };
 }
