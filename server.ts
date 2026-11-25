@@ -1,9 +1,10 @@
-// Swarmleash backend: Bybit testnet market data over a small JSON API.
+// Swarmleash backend: Bybit testnet market data and guarded orders over a small JSON API.
 // Keys live here (env), never in the glasses app. Testnet/paper only.
 // Run with: node server.ts  (Node 22.18+ strips the types natively)
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
-import type { Pair } from './src/types.ts';
+import type { Mode, OrderRequest, OrderResult, Pair } from './src/types.ts';
 
 // ---------- env ----------
 try {
@@ -15,7 +16,12 @@ try {
 
 const PORT = Number(process.env.PORT) || 8787;
 const BYBIT = 'https://api-testnet.bybit.com';
-const PAIRS: Pair[] = ['ETHUSDT', 'BTCUSDT', 'SOLUSDT'];
+const KEY = process.env.BYBIT_TESTNET_KEY;
+const SECRET = process.env.BYBIT_TESTNET_SECRET;
+const LIVE_ORDERS = Boolean(KEY && SECRET);
+const MODE: Mode = LIVE_ORDERS ? 'testnet' : 'paper';
+const MAX_QTY: Record<Pair, number> = { ETHUSDT: 0.5, BTCUSDT: 0.01, SOLUSDT: 5 }; // hard size cap
+const PAIRS = Object.keys(MAX_QTY) as Pair[];
 const isPair = (s: unknown): s is Pair => typeof s === 'string' && (PAIRS as string[]).includes(s);
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -51,7 +57,34 @@ async function market(symbol: Pair): Promise<Market> {
   return { closes: candles.map(x => x.c), candles, price: Number(tk.lastPrice), funding: Number(tk.fundingRate) };
 }
 
+// ---------- guarded orders ----------
+const state: { orders: (OrderRequest & { ts: number })[] } = { orders: [] };
+
+async function bybitOrder(o: Pick<OrderRequest, 'symbol' | 'side' | 'qty'>): Promise<{ retCode: number; retMsg: string }> {
+  if (!KEY || !SECRET) throw new Error('Bybit keys not set');
+  const body = JSON.stringify({ category: 'linear', symbol: o.symbol, side: o.side, orderType: 'Market', qty: String(o.qty) });
+  const ts = String(Date.now()), rw = '5000';
+  const sig = crypto.createHmac('sha256', SECRET).update(ts + KEY + rw + body).digest('hex');
+  return getJson(`${BYBIT}/v5/order/create`, { method: 'POST', body, headers: {
+    'Content-Type': 'application/json', 'X-BAPI-API-KEY': KEY, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': rw, 'X-BAPI-SIGN': sig } });
+}
+
+async function executeOrder(o: OrderRequest): Promise<OrderResult> {
+  if (!isPair(o.symbol)) return { ok: false, status: 400, error: 'unknown symbol' };
+  const cap = MAX_QTY[o.symbol];
+  if (!['Buy', 'Sell'].includes(o.side) || !(o.qty > 0) || o.qty > cap) return { ok: false, status: 400, error: `size cap ${cap}` };
+  const m = await market(o.symbol);
+  const r = LIVE_ORDERS ? await bybitOrder(o) : { retCode: 0, retMsg: 'paper fill' };
+  state.orders.push({ ts: Date.now(), ...o });
+  return { ok: r.retCode === 0, mode: MODE, fillPrice: m.price, msg: r.retMsg };
+}
+
 // ---------- HTTP API ----------
+async function readJson<T>(req: http.IncomingMessage): Promise<T> {
+  let s = '';
+  for await (const c of req) s += c;
+  return (s ? JSON.parse(s) : {}) as T;
+}
 const send = (res: http.ServerResponse, code: number, obj: unknown): void => {
   res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'content-type' });
   res.end(JSON.stringify(obj));
@@ -65,8 +98,12 @@ http.createServer(async (req, res) => {
       const q = url.searchParams.get('symbol');
       const symbol: Pair = isPair(q) ? q : 'ETHUSDT';
       const m = await market(symbol);
-      return send(res, 200, { symbol, price: m.price, funding: m.funding, series: m.closes.slice(-60), indicators: indicators(m), ts: Date.now() });
+      return send(res, 200, { symbol, price: m.price, funding: m.funding, series: m.closes.slice(-60), indicators: indicators(m), mode: MODE, ts: Date.now() });
+    }
+    if (url.pathname === '/api/order' && req.method === 'POST') {
+      const r = await executeOrder(await readJson<OrderRequest>(req));
+      return send(res, r.status || 200, r);
     }
     send(res, 404, { error: 'not found' });
   } catch (e) { send(res, 500, { error: errMsg(e) }); }
-}).listen(PORT, () => console.log(`swarmleash backend :${PORT} (Bybit testnet market data)`));
+}).listen(PORT, () => console.log(`swarmleash backend :${PORT} (${LIVE_ORDERS ? 'Bybit testnet orders' : 'paper orders'})`));
