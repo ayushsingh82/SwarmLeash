@@ -1,10 +1,10 @@
-// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal and guarded orders over a small JSON API.
+// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal, the pre-mortem and guarded orders over a small JSON API.
 // Keys live here (env), never in the glasses app. Testnet/paper only.
 // Run with: node server.ts  (Node 22.18+ strips the types natively)
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import type { AgentVote, JournalEntry, JournalResponse, Mode, OrderRequest, OrderResult, Pair, Proposal, Side, TagStat } from './src/types.ts';
+import type { AgentVote, Challenge, JournalEntry, JournalResponse, Mode, OrderRequest, OrderResult, Pair, PreMortem, Proposal, Side, Support, TagStat, Verdict } from './src/types.ts';
 
 // ---------- env ----------
 try {
@@ -101,6 +101,10 @@ let journal: JournalEntry[] = [];
 try { journal = JSON.parse(fs.readFileSync(JOURNAL_FILE, 'utf8')) as JournalEntry[]; } catch { /* first run */ }
 const saveJournal = (): void => { try { fs.writeFileSync(JOURNAL_FILE, JSON.stringify(journal, null, 1)); } catch { /* read-only fs */ } };
 
+function record(tag: string, side?: Side | null): TagStat {
+  const rows = journal.filter(e => e.status === 'closed' && e.tags.includes(tag) && (!side || e.side === side));
+  return { tag, n: rows.length, wins: rows.filter(e => e.win).length };
+}
 function journalStats(): TagStat[] {
   const by: Record<string, TagStat> = {};
   for (const e of journal.filter(x => x.status === 'closed')) {
@@ -119,6 +123,54 @@ function seedJournal(): void { // demo history so the pre-mortem has something t
     mk(7, 'short ETH, overextended', 'Sell', ['overextended'], true, 1.2), mk(8, 'long ETH, buying the dip', 'Buy', ['dip'], true, 0.8),
     mk(9, 'long ETH, buying the dip', 'Buy', ['dip'], false, -1.0)]);
   saveJournal();
+}
+
+// ---------- thesis parsing ----------
+interface Thesis { side: Side | null; symbol: Pair; tags: string[] }
+const TAGS: [string, RegExp][] = [['news', /news|etf|fed|headline|announce|rumou?r|cpi|report|tweet/], ['breakout', /breakout|break out|resistance|ath|all.time/],
+  ['dip', /dip|bounce|oversold|cheap|discount/], ['momentum', /momentum|trend|running|pumping|ripping/], ['fomo', /fomo|everyone|missing|can'?t miss|moon/],
+  ['revenge', /revenge|win it back|make it back|recover|get back/], ['overextended', /overextended|too high|top|exhausted|overbought/]];
+
+function parseThesis(text: string): Thesis {
+  const t = text.toLowerCase();
+  const sell = /\b(short|sell|bear|dump|fade|drop)\b/.test(t), buy = /\b(long|buy|bull|pump|ape)\b/.test(t);
+  const side: Side | null = sell && !buy ? 'Sell' : buy && !sell ? 'Buy' : sell ? 'Sell' : null;
+  const symbol: Pair = /\bbtc|bitcoin\b/.test(t) ? 'BTCUSDT' : /\bsol/.test(t) ? 'SOLUSDT' : 'ETHUSDT';
+  const tags = TAGS.filter(([, re]) => re.test(t)).map(([n]) => n);
+  if (!tags.length) tags.push('hunch');
+  return { side, symbol, tags };
+}
+
+// ---------- pre-mortem: the devil's advocate ----------
+function premortem(text: string, m: Market, tiltReasons: string[], parsed?: Thesis): PreMortem {
+  const th = parsed ?? parseThesis(text), ind = indicators(m), cap = MAX_QTY[th.symbol];
+  const side = th.side, tag = th.tags[0] ?? 'hunch', hist = record(tag, side);
+  const ch: Challenge[] = []; // candidate counter-arguments, strongest wins
+  if (tiltReasons.length) ch.push({ kind: 'tilt', text: `You are tilting: ${tiltReasons[0]}`, strength: 0.95 });
+  if (hist.n >= 2) { const rate = hist.wins / hist.n; ch.push({ kind: 'history', text: `Your ${hist.n} ${tag} trades: ${hist.wins} won`, strength: hist.n >= 3 ? Math.min(1, 0.35 + (1 - rate) * 0.65) : 0.3 * (1 - rate) }); }
+  if (side === 'Buy' && m.funding > 0.0002) ch.push({ kind: 'funding', text: `Crowded long, funding +${(m.funding * 100).toFixed(3)}%`, strength: 0.7 });
+  if (side === 'Sell' && m.funding < -0.0002) ch.push({ kind: 'funding', text: `Crowded short, funding ${(m.funding * 100).toFixed(3)}%`, strength: 0.7 });
+  if (side === 'Buy' && ind.fast < ind.slow) ch.push({ kind: 'trend', text: 'Trend is down (EMA9 < EMA21)', strength: 0.6 });
+  if (side === 'Sell' && ind.fast > ind.slow) ch.push({ kind: 'trend', text: 'Trend is up (EMA9 > EMA21)', strength: 0.6 });
+  if (side === 'Buy' && ind.rsi > 70) ch.push({ kind: 'rsi', text: `Overbought, RSI ${ind.rsi.toFixed(0)}`, strength: 0.65 });
+  if (side === 'Sell' && ind.rsi < 30) ch.push({ kind: 'rsi', text: `Oversold, RSI ${ind.rsi.toFixed(0)}`, strength: 0.65 });
+  if (ind.atrPct > 0.35) ch.push({ kind: 'vol', text: `Wild market, vol ${ind.atrPct.toFixed(2)}%`, strength: 0.5 });
+  if (['fomo', 'revenge'].includes(tag)) ch.push({ kind: 'bias', text: `"${tag}" is a bias, not a reason`, strength: 0.75 });
+  const pro: Support[] = []; // evidence that agrees with the trade, so the debate is two-sided
+  if (side === 'Buy' && ind.fast > ind.slow) pro.push({ kind: 'trend', text: 'Trend agrees (EMA9 > EMA21)' });
+  if (side === 'Sell' && ind.fast < ind.slow) pro.push({ kind: 'trend', text: 'Trend agrees (EMA9 < EMA21)' });
+  if (hist.n >= 2 && hist.wins / hist.n >= 0.66) pro.push({ kind: 'history', text: `Your ${hist.n} ${tag} trades: ${hist.wins} won` });
+  if (side === 'Buy' && m.funding < 0) pro.push({ kind: 'funding', text: 'Shorts are crowded (negative funding)' });
+  if (side === 'Sell' && m.funding > 0.0002) pro.push({ kind: 'funding', text: 'Longs are crowded (positive funding)' });
+  if (ind.atrPct <= 0.2) pro.push({ kind: 'vol', text: `Calm market, vol ${ind.atrPct.toFixed(2)}%` });
+  ch.sort((a, b) => b.strength - a.strength);
+  if (!ch.length) ch.push({ kind: 'none', text: 'No red flags found', strength: 0 });
+  const top = ch[0]?.strength ?? 0;
+  const verdict: Verdict = top >= 0.7 ? 'RED' : top >= 0.4 ? 'AMBER' : 'GREEN';
+  const qty = +(cap * (verdict === 'RED' ? 0.3 : 0.6)).toFixed(4);
+  return { thesis: text, symbol: th.symbol, side, tags: th.tags, qty, price: m.price, challenges: ch.slice(0, 3), support: pro.slice(0, 2), verdict,
+    venues: [{ venue: 'Bybit', rate8h: m.funding }], history: hist, tilt: tiltReasons, series: m.closes.slice(-60), mode: MODE, ts: Date.now(),
+    summary: side ? `${side === 'Buy' ? 'LONG' : 'SHORT'} ${th.symbol.replace('USDT', '')} ${qty}` : 'Say long or short' };
 }
 
 // ---------- guarded orders ----------
@@ -172,6 +224,12 @@ http.createServer(async (req, res) => {
     if (url.pathname === '/api/order' && req.method === 'POST') {
       const r = await executeOrder(await readJson<OrderRequest>(req));
       return send(res, r.status || 200, r);
+    }
+    if (url.pathname === '/api/premortem' && req.method === 'POST') {
+      const { text } = await readJson<{ text?: string }>(req);
+      if (!text || text.length > 300) return send(res, 400, { error: 'say your trade' });
+      const th = parseThesis(text), m = await market(th.symbol);
+      return send(res, 200, premortem(text, m, tilt(m), th));
     }
     if (url.pathname === '/api/journal') return send(res, 200, { entries: journal.slice(-30).reverse(), stats: journalStats() } satisfies JournalResponse);
     if (url.pathname === '/api/journal/seed' && req.method === 'POST') { seedJournal(); return send(res, 200, { ok: true, stats: journalStats() }); }
