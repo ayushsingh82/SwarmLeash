@@ -1,4 +1,4 @@
-// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal, the pre-mortem, cross-venue funding, exit plans, positions with P&L and guarded orders over a small JSON API.
+// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal, the pre-mortem, cross-venue funding, exit plans, positions with P&L, Gemini voice and guarded orders over a small JSON API.
 // Keys live here (env), never in the glasses app. Testnet/paper only.
 // Run with: node server.ts  (Node 22.18+ strips the types natively)
 import http from 'node:http';
@@ -238,6 +238,7 @@ const TAGS: [string, RegExp][] = [['news', /news|etf|fed|headline|announce|rumou
   ['dip', /dip|bounce|oversold|cheap|discount/], ['momentum', /momentum|trend|running|pumping|ripping/], ['fomo', /fomo|everyone|missing|can'?t miss|moon/],
   ['revenge', /revenge|win it back|make it back|recover|get back/], ['overextended', /overextended|too high|top|exhausted|overbought/]];
 
+const TAG_NAMES = TAGS.map(([n]) => n);
 function parseThesis(text: string): Thesis {
   const t = text.toLowerCase();
   const sell = /\b(short|sell|bear|dump|fade|drop)\b/.test(t), buy = /\b(long|buy|bull|pump|ape)\b/.test(t);
@@ -246,6 +247,64 @@ function parseThesis(text: string): Thesis {
   const tags = TAGS.filter(([, re]) => re.test(t)).map(([n]) => n);
   if (!tags.length) tags.push('hunch');
   return { side, symbol, tags, stop: level(text, STOP_RE), target: level(text, TARGET_RE) };
+}
+
+// ---------- Gemini (optional): speech-to-text + flexible thesis parsing ----------
+type GeminiPart = { text: string } | { inline_data: { mime_type: string; data: string } };
+interface GeminiResponse { error?: { code: number; message: string }; candidates?: { content?: { parts?: { text?: string }[] } }[] }
+const GEMINI = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+let geminiWorks: string | null = null; // last model that answered, tried first next time
+
+async function gemini(parts: GeminiPart[], json = false, ms = 8000): Promise<string> {
+  const chain = [...new Set([geminiWorks, GEMINI_MODEL, 'gemini-3.5-flash', 'gemini-3.1-flash-lite'].filter((x): x is string => Boolean(x)))];
+  const t0 = Date.now();
+  let last = 'no model answered';
+  for (const model of chain) {
+    const left = ms - (Date.now() - t0);
+    if (left < 800) break;
+    try {
+      const r = await getJson<GeminiResponse>(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: 'POST', signal: AbortSignal.timeout(Math.min(left, 6000)),
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': GEMINI ?? '' },
+        body: JSON.stringify({ contents: [{ parts }], generationConfig: { temperature: 0, ...(json ? { responseMimeType: 'application/json' } : {}) } }) });
+      if (r.error) {
+        last = `${model}: ${r.error.message}`;
+        if ([400, 401, 403].includes(r.error.code)) throw new Error(last);
+        continue; // 404/429/503: try the next model
+      }
+      const text = r.candidates?.[0]?.content?.parts?.map(p => p.text ?? '').join('') ?? '';
+      if (geminiWorks !== model) { geminiWorks = model; console.log('gemini model in use:', model); }
+      return text;
+    } catch (e) {
+      last = `${model}: ${errMsg(e)}`;
+      if (/API key|PERMISSION|UNAUTH/i.test(errMsg(e))) throw e;
+    }
+  }
+  throw new Error(last);
+}
+
+function wavFromPcm(raw: Buffer): Buffer { // 16 kHz mono PCM16 -> WAV
+  const h = Buffer.alloc(44);
+  h.write('RIFF'); h.writeUInt32LE(36 + raw.length, 4); h.write('WAVEfmt ', 8); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20);
+  h.writeUInt16LE(1, 22); h.writeUInt32LE(16000, 24); h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
+  h.write('data', 36); h.writeUInt32LE(raw.length, 40);
+  return Buffer.concat([h, raw]);
+}
+
+async function parseSmart(text: string): Promise<Thesis> { // Gemini understands free-form speech; the keyword parser is the safety net
+  const rules = parseThesis(text);
+  if (!GEMINI) return rules;
+  try {
+    const out = await gemini([{ text: `Parse this spoken crypto trade idea into JSON {"side":"Buy"|"Sell"|null,"symbol":"ETHUSDT"|"BTCUSDT"|"SOLUSDT","tags":[...]}.
+"Buy" = long/bullish, "Sell" = short/bearish, null if no direction is stated. Default symbol ETHUSDT. tags: choose 1-2 from ${JSON.stringify(TAG_NAMES)} describing the REASON given, or ["hunch"] if there is no clear reason.
+Idea: ${JSON.stringify(text)}` }], true, 8000);
+    const j = JSON.parse(out.replace(/```json|```/g, '')) as { side?: unknown; symbol?: unknown; tags?: unknown };
+    const side: Side | null = j.side === 'Buy' || j.side === 'Sell' ? j.side : null;
+    const symbol: Pair = isPair(j.symbol) ? j.symbol : rules.symbol;
+    const tags = (Array.isArray(j.tags) ? j.tags : []).filter((t): t is string => typeof t === 'string' && (TAG_NAMES.includes(t) || t === 'hunch')).slice(0, 2);
+    return { side: side ?? rules.side, symbol, tags: tags.length ? tags : rules.tags, stop: rules.stop, target: rules.target };
+  } catch (e) { console.warn('gemini parse fell back to keywords:', errMsg(e).slice(0, 200)); return rules; }
 }
 
 // ---------- pre-mortem: the devil's advocate ----------
@@ -358,7 +417,7 @@ http.createServer(async (req, res) => {
     if (url.pathname === '/api/premortem' && req.method === 'POST') {
       const { text } = await readJson<{ text?: string }>(req);
       if (!text || text.length > 300) return send(res, 400, { error: 'say your trade' });
-      const th = parseThesis(text), m = await market(th.symbol); await settleAuto();
+      const th = await parseSmart(text), m = await market(th.symbol); await settleAuto();
       return send(res, 200, premortem(text, m, tilt(m), th));
     }
     if (url.pathname === '/api/positions') return send(res, 200, await listPositions());
@@ -371,13 +430,31 @@ http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, closed });
     }
     if (url.pathname === '/api/edge') return send(res, 200, edgeReport());
-    if (url.pathname === '/api/status') return send(res, 200, { bybit: LIVE_ORDERS, orders5m: state.orders.filter(o => Date.now() - o.ts < 3e5).length });
+    if (url.pathname === '/api/status') return send(res, 200, { gemini: !!GEMINI, model: geminiWorks, bybit: LIVE_ORDERS, orders5m: state.orders.filter(o => Date.now() - o.ts < 3e5).length });
     if (url.pathname === '/api/journal') {
       await settleAuto();
       return send(res, 200, { entries: journal.slice(-30).reverse(), stats: journalStats() } satisfies JournalResponse);
     }
     if (url.pathname === '/api/journal/seed' && req.method === 'POST') { seedJournal(); return send(res, 200, { ok: true, stats: journalStats() }); }
     if (url.pathname === '/api/tilt') { state.tiltForced = true; return send(res, 200, { ok: true }); } // demo helper
+    if (url.pathname === '/api/stt' && req.method === 'POST') { // glasses mic PCM -> text
+      const { pcm } = await readJson<{ pcm?: string }>(req);
+      const raw = Buffer.from(pcm ?? '', 'base64');
+      if (raw.length < 3200) return send(res, 200, { text: '', error: 'no audio captured' });
+      const wav = wavFromPcm(raw);
+      if (GEMINI) {
+        try {
+          const text = (await gemini([{ text: 'Transcribe this audio exactly. It is a trader describing a crypto trade; expect words like long, short, ETH (Ethereum), BTC, SOL, ETF, Fed, breakout, dip, FOMO, funding. Reply with only the words spoken, nothing else. If there is no speech, reply with an empty string.' },
+            { inline_data: { mime_type: 'audio/wav', data: wav.toString('base64') } }], false, 12000)).trim();
+          return send(res, 200, { text });
+        } catch (e) { return send(res, 200, { text: '', error: 'gemini: ' + errMsg(e) }); }
+      }
+      if (!process.env.OPENAI_API_KEY) return send(res, 200, { text: '', error: 'set GEMINI_API_KEY (or OPENAI_API_KEY) for glasses voice' });
+      const fd = new FormData(); fd.append('model', 'whisper-1'); fd.append('file', new Blob([new Uint8Array(wav)], { type: 'audio/wav' }), 'a.wav');
+      const r = await getJson<{ text?: string; error?: { message: string } }>('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: fd });
+      return send(res, 200, { text: r.text ?? '', error: r.error?.message });
+    }
+    if (url.pathname === '/api/tilt') { state.tiltForced = true; return send(res, 200, { ok: true }); } // demo helper
     send(res, 404, { error: 'not found' });
   } catch (e) { send(res, 500, { error: errMsg(e) }); }
-}).listen(PORT, () => console.log(`swarmleash backend :${PORT} (${LIVE_ORDERS ? 'Bybit testnet orders' : 'paper orders'})`));
+}).listen(PORT, () => console.log(`swarmleash backend :${PORT} (${LIVE_ORDERS ? 'Bybit testnet orders' : 'paper orders'}, ${GEMINI ? 'Gemini ' + GEMINI_MODEL : 'no Gemini: keyword parser, no glasses voice'})`));
