@@ -1,10 +1,10 @@
-// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal, the pre-mortem and guarded orders over a small JSON API.
+// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal, the pre-mortem, cross-venue funding and guarded orders over a small JSON API.
 // Keys live here (env), never in the glasses app. Testnet/paper only.
 // Run with: node server.ts  (Node 22.18+ strips the types natively)
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import type { AgentVote, Challenge, JournalEntry, JournalResponse, Mode, OrderRequest, OrderResult, Pair, PreMortem, Proposal, Side, Support, TagStat, Verdict } from './src/types.ts';
+import type { AgentVote, Challenge, JournalEntry, JournalResponse, Mode, OrderRequest, OrderResult, Pair, PreMortem, Proposal, Side, Support, TagStat, Verdict, VenueRate } from './src/types.ts';
 
 // ---------- env ----------
 try {
@@ -30,7 +30,7 @@ async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 interface Candle { h: number; l: number; c: number }
-interface Market { closes: number[]; candles: Candle[]; price: number; funding: number }
+interface Market { closes: number[]; candles: Candle[]; price: number; funding: number; venues: VenueRate[] }
 
 // ---------- indicators ----------
 const ema = (a: number[], n: number): number => { const k = 2 / (n + 1); return a.reduce((p, v, i) => (i ? v * k + p * (1 - k) : v)); };
@@ -54,17 +54,50 @@ async function market(symbol: Pair): Promise<Market> {
   const candles: Candle[] = k.result.list.map(x => ({ h: Number(x[2]), l: Number(x[3]), c: Number(x[4]) })).reverse();
   const tk = t.result.list[0];
   if (!tk) throw new Error('no ticker for ' + symbol);
-  return { closes: candles.map(x => x.c), candles, price: Number(tk.lastPrice), funding: Number(tk.fundingRate) };
+  const funding = Number(tk.fundingRate);
+  return { closes: candles.map(x => x.c), candles, price: Number(tk.lastPrice), funding, venues: await venueFunding(symbol, funding) };
 }
+
+// ---------- cross-venue funding (public data, no keys) ----------
+const HL_COIN: Record<Pair, string> = { ETHUSDT: 'ETH', BTCUSDT: 'BTC', SOLUSDT: 'SOL' };
+const venueCache = new Map<string, { ts: number; value: number | null }>();
+async function cached(key: string, ttl: number, load: () => Promise<number | null>): Promise<number | null> {
+  const hit = venueCache.get(key);
+  if (hit && Date.now() - hit.ts < ttl) return hit.value;
+  let value: number | null = null;
+  try { value = await load(); } catch { value = null; } // a venue being down never breaks a pre-mortem
+  venueCache.set(key, { ts: Date.now(), value });
+  return value;
+}
+const hyperliquidRate = (symbol: Pair): Promise<number | null> => cached('hl:' + symbol, 30e3, async () => {
+  const [meta, ctxs] = await getJson<[{ universe: { name: string }[] }, { funding: string }[]]>('https://api.hyperliquid.xyz/info', {
+    method: 'POST', signal: AbortSignal.timeout(3000), headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'metaAndAssetCtxs' }) });
+  const i = meta.universe.findIndex(u => u.name === HL_COIN[symbol]);
+  const f = i >= 0 ? ctxs[i]?.funding : undefined;
+  return f === undefined ? null : Number(f) * 8; // Hyperliquid pays funding hourly
+});
+const binanceRate = (symbol: Pair): Promise<number | null> => cached('bn:' + symbol, 30e3, async () => {
+  const j = await getJson<{ lastFundingRate?: string }>(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`, { signal: AbortSignal.timeout(3000) });
+  return j.lastFundingRate === undefined ? null : Number(j.lastFundingRate);
+});
+async function venueFunding(symbol: Pair, bybit: number): Promise<VenueRate[]> {
+  const [hl, bn] = await Promise.all([hyperliquidRate(symbol), binanceRate(symbol)]);
+  const out: VenueRate[] = [{ venue: 'Bybit', rate8h: bybit }];
+  if (hl !== null) out.push({ venue: 'Hyperliquid', rate8h: hl });
+  if (bn !== null) out.push({ venue: 'Binance', rate8h: bn });
+  return out;
+}
+const pct3 = (r: number): string => `${r >= 0 ? '+' : ''}${(r * 100).toFixed(3)}%`;
+const CROWDED = 0.0001; // above the usual 0.01% per 8h baseline premium
 
 // ---------- swarm second opinion ----------
 function runAgents(m: Market): AgentVote[] {
   const { fast, slow, rsi: r, atrPct } = indicators(m);
-  const { funding } = m;
+  const funding = m.venues.reduce((a, v) => a + v.rate8h, 0) / m.venues.length;
   return [
     { name: 'Trend', vote: fast > slow ? 1 : -1, why: `EMA9 ${fast > slow ? 'above' : 'below'} EMA21` },
     { name: 'Momentum', vote: r > 58 ? 1 : r < 42 ? -1 : 0, why: `RSI ${r.toFixed(0)}` },
-    { name: 'Funding', vote: funding > 0.0003 ? -1 : funding < -0.0003 ? 1 : 0, why: `funding ${(funding * 100).toFixed(3)}% (contrarian)` },
+    { name: 'Funding', vote: funding > CROWDED ? -1 : funding < -CROWDED ? 1 : 0, why: m.venues.map(v => `${v.venue} ${pct3(v.rate8h)}`).join(' · ') },
     { name: 'Risk', vote: atrPct > 0.35 ? 0 : 1, why: `vol ${atrPct.toFixed(2)}%`, atrPct },
   ];
 }
@@ -79,7 +112,7 @@ function propose(symbol: Pair, m: Market): Omit<Proposal, 'tilt' | 'mode'> {
   const conf = Math.round((agree / 3) * 100 * (risk.vote ? 1 : 0.6));
   const cap = MAX_QTY[symbol];
   const qty = +(cap * (risk.vote ? 0.6 : 0.3)).toFixed(4); // risk agent sizes down
-  return { symbol, side, qty, price: m.price, series: m.closes.slice(-60), agents, agree, conf, ts: Date.now(),
+  return { symbol, side, qty, price: m.price, series: m.closes.slice(-60), agents, venues: m.venues, agree, conf, ts: Date.now(),
     summary: side ? `${side === 'Buy' ? 'LONG' : 'SHORT'} ${symbol.replace('USDT', '')} ${qty}` : 'No trade: swarm split' };
 }
 
@@ -148,8 +181,9 @@ function premortem(text: string, m: Market, tiltReasons: string[], parsed?: Thes
   const ch: Challenge[] = []; // candidate counter-arguments, strongest wins
   if (tiltReasons.length) ch.push({ kind: 'tilt', text: `You are tilting: ${tiltReasons[0]}`, strength: 0.95 });
   if (hist.n >= 2) { const rate = hist.wins / hist.n; ch.push({ kind: 'history', text: `Your ${hist.n} ${tag} trades: ${hist.wins} won`, strength: hist.n >= 3 ? Math.min(1, 0.35 + (1 - rate) * 0.65) : 0.3 * (1 - rate) }); }
-  if (side === 'Buy' && m.funding > 0.0002) ch.push({ kind: 'funding', text: `Crowded long, funding +${(m.funding * 100).toFixed(3)}%`, strength: 0.7 });
-  if (side === 'Sell' && m.funding < -0.0002) ch.push({ kind: 'funding', text: `Crowded short, funding ${(m.funding * 100).toFixed(3)}%`, strength: 0.7 });
+  const crowdedLong = m.venues.filter(v => v.rate8h > CROWDED).length, crowdedShort = m.venues.filter(v => v.rate8h < -CROWDED).length, nv = m.venues.length;
+  if (side === 'Buy' && crowdedLong) ch.push({ kind: 'funding', text: `Crowded long on ${crowdedLong} of ${nv} venues`, strength: Math.min(0.85, 0.6 + 0.1 * (crowdedLong - 1)) });
+  if (side === 'Sell' && crowdedShort) ch.push({ kind: 'funding', text: `Crowded short on ${crowdedShort} of ${nv} venues`, strength: Math.min(0.85, 0.6 + 0.1 * (crowdedShort - 1)) });
   if (side === 'Buy' && ind.fast < ind.slow) ch.push({ kind: 'trend', text: 'Trend is down (EMA9 < EMA21)', strength: 0.6 });
   if (side === 'Sell' && ind.fast > ind.slow) ch.push({ kind: 'trend', text: 'Trend is up (EMA9 > EMA21)', strength: 0.6 });
   if (side === 'Buy' && ind.rsi > 70) ch.push({ kind: 'rsi', text: `Overbought, RSI ${ind.rsi.toFixed(0)}`, strength: 0.65 });
@@ -160,8 +194,8 @@ function premortem(text: string, m: Market, tiltReasons: string[], parsed?: Thes
   if (side === 'Buy' && ind.fast > ind.slow) pro.push({ kind: 'trend', text: 'Trend agrees (EMA9 > EMA21)' });
   if (side === 'Sell' && ind.fast < ind.slow) pro.push({ kind: 'trend', text: 'Trend agrees (EMA9 < EMA21)' });
   if (hist.n >= 2 && hist.wins / hist.n >= 0.66) pro.push({ kind: 'history', text: `Your ${hist.n} ${tag} trades: ${hist.wins} won` });
-  if (side === 'Buy' && m.funding < 0) pro.push({ kind: 'funding', text: 'Shorts are crowded (negative funding)' });
-  if (side === 'Sell' && m.funding > 0.0002) pro.push({ kind: 'funding', text: 'Longs are crowded (positive funding)' });
+  if (side === 'Buy' && crowdedShort) pro.push({ kind: 'funding', text: `Shorts are crowded on ${crowdedShort} of ${nv} venues` });
+  if (side === 'Sell' && crowdedLong) pro.push({ kind: 'funding', text: `Longs are crowded on ${crowdedLong} of ${nv} venues` });
   if (ind.atrPct <= 0.2) pro.push({ kind: 'vol', text: `Calm market, vol ${ind.atrPct.toFixed(2)}%` });
   ch.sort((a, b) => b.strength - a.strength);
   if (!ch.length) ch.push({ kind: 'none', text: 'No red flags found', strength: 0 });
@@ -169,7 +203,7 @@ function premortem(text: string, m: Market, tiltReasons: string[], parsed?: Thes
   const verdict: Verdict = top >= 0.7 ? 'RED' : top >= 0.4 ? 'AMBER' : 'GREEN';
   const qty = +(cap * (verdict === 'RED' ? 0.3 : 0.6)).toFixed(4);
   return { thesis: text, symbol: th.symbol, side, tags: th.tags, qty, price: m.price, challenges: ch.slice(0, 3), support: pro.slice(0, 2), verdict,
-    venues: [{ venue: 'Bybit', rate8h: m.funding }], history: hist, tilt: tiltReasons, series: m.closes.slice(-60), mode: MODE, ts: Date.now(),
+    venues: m.venues, history: hist, tilt: tiltReasons, series: m.closes.slice(-60), mode: MODE, ts: Date.now(),
     summary: side ? `${side === 'Buy' ? 'LONG' : 'SHORT'} ${th.symbol.replace('USDT', '')} ${qty}` : 'Say long or short' };
 }
 
