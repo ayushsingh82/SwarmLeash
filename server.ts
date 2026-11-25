@@ -1,10 +1,10 @@
-// Swarmleash backend: Bybit testnet market data and guarded orders over a small JSON API.
+// Swarmleash backend: Bybit testnet market data, a four-agent swarm and guarded orders over a small JSON API.
 // Keys live here (env), never in the glasses app. Testnet/paper only.
 // Run with: node server.ts  (Node 22.18+ strips the types natively)
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import type { Mode, OrderRequest, OrderResult, Pair } from './src/types.ts';
+import type { AgentVote, Mode, OrderRequest, OrderResult, Pair, Proposal, Side } from './src/types.ts';
 
 // ---------- env ----------
 try {
@@ -57,6 +57,32 @@ async function market(symbol: Pair): Promise<Market> {
   return { closes: candles.map(x => x.c), candles, price: Number(tk.lastPrice), funding: Number(tk.fundingRate) };
 }
 
+// ---------- swarm second opinion ----------
+function runAgents(m: Market): AgentVote[] {
+  const { fast, slow, rsi: r, atrPct } = indicators(m);
+  const { funding } = m;
+  return [
+    { name: 'Trend', vote: fast > slow ? 1 : -1, why: `EMA9 ${fast > slow ? 'above' : 'below'} EMA21` },
+    { name: 'Momentum', vote: r > 58 ? 1 : r < 42 ? -1 : 0, why: `RSI ${r.toFixed(0)}` },
+    { name: 'Funding', vote: funding > 0.0003 ? -1 : funding < -0.0003 ? 1 : 0, why: `funding ${(funding * 100).toFixed(3)}% (contrarian)` },
+    { name: 'Risk', vote: atrPct > 0.35 ? 0 : 1, why: `vol ${atrPct.toFixed(2)}%`, atrPct },
+  ];
+}
+
+function propose(symbol: Pair, m: Market): Omit<Proposal, 'tilt' | 'mode'> {
+  const agents = runAgents(m);
+  const voters = agents.slice(0, 3);
+  const dir = voters.reduce((s, a) => s + a.vote, 0);
+  const side: Side | null = dir > 0 ? 'Buy' : dir < 0 ? 'Sell' : null;
+  const risk = agents[3] as AgentVote;
+  const agree = side ? voters.filter(a => a.vote === (dir > 0 ? 1 : -1)).length : 0;
+  const conf = Math.round((agree / 3) * 100 * (risk.vote ? 1 : 0.6));
+  const cap = MAX_QTY[symbol];
+  const qty = +(cap * (risk.vote ? 0.6 : 0.3)).toFixed(4); // risk agent sizes down
+  return { symbol, side, qty, price: m.price, series: m.closes.slice(-60), agents, agree, conf, ts: Date.now(),
+    summary: side ? `${side === 'Buy' ? 'LONG' : 'SHORT'} ${symbol.replace('USDT', '')} ${qty}` : 'No trade: swarm split' };
+}
+
 // ---------- guarded orders ----------
 const state: { orders: (OrderRequest & { ts: number })[] } = { orders: [] };
 
@@ -94,11 +120,11 @@ http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return send(res, 204, {});
   const url = new URL(req.url ?? '/', 'http://x');
   try {
-    if (url.pathname === '/api/proposal') { // market snapshot; the swarm agents arrive in a later commit
+    if (url.pathname === '/api/proposal') { // the swarm's second opinion on the market right now
       const q = url.searchParams.get('symbol');
       const symbol: Pair = isPair(q) ? q : 'ETHUSDT';
       const m = await market(symbol);
-      return send(res, 200, { symbol, price: m.price, funding: m.funding, series: m.closes.slice(-60), indicators: indicators(m), mode: MODE, ts: Date.now() });
+      return send(res, 200, { ...propose(symbol, m), tilt: [], mode: MODE } satisfies Proposal);
     }
     if (url.pathname === '/api/order' && req.method === 'POST') {
       const r = await executeOrder(await readJson<OrderRequest>(req));
