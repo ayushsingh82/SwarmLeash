@@ -61,6 +61,10 @@ Then it stays with you after the trade: a 3-second undo window before the order 
 
 Swarmleash is a small crew of specialist agents, each with one job. They run on live market data and your own journal, and **you always keep the leash**: nothing is sent without your tap, and a Risk agent and Tilt Guard can slow you down.
 
+<p align="center">
+  <img src="docs/swarm.png" alt="Swarm second opinion: Trend, Momentum, Funding and Risk agent cards" width="420">
+</p>
+
 **Swarm vote** (the second opinion, `GET /api/proposal`):
 
 | Agent | Reads | Votes |
