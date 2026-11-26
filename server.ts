@@ -1,10 +1,12 @@
-// Swarmleash backend: Bybit testnet market data, a four-agent swarm, Tilt Guard, a trading journal, the pre-mortem, cross-venue funding, exit plans, positions with P&L, Gemini voice and guarded orders over a small JSON API.
+// Swarmleash backend: swarm debate + guarded order execution.
 // Keys live here (env), never in the glasses app. Testnet/paper only.
 // Run with: node server.ts  (Node 22.18+ strips the types natively)
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import type { AgentVote, Challenge, EdgeReport, ExitReason, JournalEntry, JournalResponse, Mode, OrderRequest, OrderResult, Pair, Position, PositionsResponse, PreMortem, Proposal, Side, Support, TagStat, Verdict, VenueRate } from './src/types.ts';
+import type {
+  AgentVote, Challenge, EdgeReport, ExitReason, JournalEntry, JournalResponse, Mode, OrderRequest, OrderResult, Pair, Position, PositionsResponse, PreMortem, Proposal, Side, Support, TagStat, Verdict, VenueRate,
+} from './src/types.ts';
 
 // ---------- env ----------
 try {
@@ -32,6 +34,9 @@ async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
 
 interface Candle { h: number; l: number; c: number }
 interface Market { closes: number[]; candles: Candle[]; price: number; funding: number; venues: VenueRate[] }
+interface Entry { side: Side; price: number; ts: number }
+
+const state: { orders: (OrderRequest & { ts: number })[]; lastEntry: Entry | null; tiltForced: boolean } = { orders: [], lastEntry: null, tiltForced: false };
 
 // ---------- indicators ----------
 const ema = (a: number[], n: number): number => { const k = 2 / (n + 1); return a.reduce((p, v, i) => (i ? v * k + p * (1 - k) : v)); };
@@ -42,11 +47,11 @@ function rsi(c: number[], n = 14): number {
 }
 function indicators(m: Market) {
   const { closes, candles, price } = m;
-  return { fast: ema(closes.slice(-30), 9), slow: ema(closes, 21), rsi: rsi(closes),
+  return { fast: ema(closes.slice(-30), 9), slow: ema(closes, 21), r: rsi(closes),
     atrPct: candles.slice(-14).reduce((s, c) => s + (c.h - c.l), 0) / 14 / price * 100 };
 }
 
-// ---------- Bybit testnet market data ----------
+// ---------- Bybit ----------
 async function market(symbol: Pair): Promise<Market> {
   const [k, t] = await Promise.all([
     getJson<{ result: { list: string[][] } }>(`${BYBIT}/v5/market/kline?category=linear&symbol=${symbol}&interval=5&limit=60`),
@@ -91,10 +96,19 @@ async function venueFunding(symbol: Pair, bybit: number): Promise<VenueRate[]> {
 const pct3 = (r: number): string => `${r >= 0 ? '+' : ''}${(r * 100).toFixed(3)}%`;
 const CROWDED = 0.0001; // above the usual 0.01% per 8h baseline premium
 
+async function bybitOrder(o: Pick<OrderRequest, 'symbol' | 'side' | 'qty'>, reduceOnly = false): Promise<{ retCode: number; retMsg: string }> {
+  if (!KEY || !SECRET) throw new Error('Bybit keys not set');
+  const body = JSON.stringify({ category: 'linear', symbol: o.symbol, side: o.side, orderType: 'Market', qty: String(o.qty), ...(reduceOnly ? { reduceOnly: true } : {}) });
+  const ts = String(Date.now()), rw = '5000';
+  const sig = crypto.createHmac('sha256', SECRET).update(ts + KEY + rw + body).digest('hex');
+  return getJson(`${BYBIT}/v5/order/create`, { method: 'POST', body, headers: {
+    'Content-Type': 'application/json', 'X-BAPI-API-KEY': KEY, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': rw, 'X-BAPI-SIGN': sig } });
+}
+
 // ---------- swarm second opinion ----------
 function runAgents(m: Market): AgentVote[] {
-  const { fast, slow, rsi: r, atrPct } = indicators(m);
   const funding = m.venues.reduce((a, v) => a + v.rate8h, 0) / m.venues.length;
+  const { fast, slow, r, atrPct } = indicators(m);
   return [
     { name: 'Trend', vote: fast > slow ? 1 : -1, why: `EMA9 ${fast > slow ? 'above' : 'below'} EMA21` },
     { name: 'Momentum', vote: r > 58 ? 1 : r < 42 ? -1 : 0, why: `RSI ${r.toFixed(0)}` },
@@ -139,6 +153,7 @@ function record(tag: string, side?: Side | null): TagStat {
   const rows = journal.filter(e => e.status === 'closed' && e.tags.includes(tag) && (!side || e.side === side));
   return { tag, n: rows.length, wins: rows.filter(e => e.win).length };
 }
+const recordLine = (tag: string, side: Side): string => { const r = record(tag, side); return r.n ? `Record on "${tag}": ${r.wins}/${r.n} won.` : ''; };
 function journalStats(): TagStat[] {
   const by: Record<string, TagStat> = {};
   for (const e of journal.filter(x => x.status === 'closed')) {
@@ -170,6 +185,9 @@ async function closePosition(e: JournalEntry, exit: number, reason: ExitReason, 
   if (full) { Object.assign(e, done); closed = e; }
   else { closed = { ...e, ...done, id: `${e.id}c${Date.now()}`, qty, status: 'closed' }; e.qty = +((e.qty ?? 0) - qty).toFixed(6); journal.push(closed); }
   saveJournal();
+  const tag = closed.tags[0] ?? 'trade';
+  const why = { stop: 'Stop hit', target: 'Target hit', manual: 'Closed', cut: 'Cut half' }[reason];
+  tgNotify(`📓 ${why}: your "${tag}" ${closed.side === 'Buy' ? 'long' : 'short'} ${pct >= 0 ? '+' : ''}${pct}% (${usd >= 0 ? '+' : ''}$${usd}), ${pct > 0 ? 'a win' : 'a loss'}. ${recordLine(tag, closed.side)}`);
   return closed;
 }
 async function settleAuto(): Promise<void> { // an open trade that hits its stop or target closes itself
@@ -205,7 +223,6 @@ function edgeText(r: EdgeReport): string {
   const line = (x?: TagStat): string => (x ? `${x.tag} ${x.wins}/${x.n} (${Math.round(x.wins / x.n * 100)}%)` : 'not enough data');
   return `📊 Your edge report\nWin rate ${r.winRate}% (${r.wins}/${r.trades}) · P&L ${r.totalPnlPct >= 0 ? '+' : ''}${r.totalPnlPct}%\n✅ Edge: ${line(r.best)}\n⚠️ Leak: ${line(r.worst)}\n🛡 Trades with a stop: ${r.withStop} of ${r.realTrades}`;
 }
-
 function seedJournal(): void { // demo history so the pre-mortem has something to push back with
   const base = Date.now() - 86400e3;
   const mk = (i: number, text: string, side: Side, tags: string[], win: boolean, pnl: number): JournalEntry =>
@@ -237,8 +254,8 @@ function level(text: string, re: RegExp): Level | undefined {
 const TAGS: [string, RegExp][] = [['news', /news|etf|fed|headline|announce|rumou?r|cpi|report|tweet/], ['breakout', /breakout|break out|resistance|ath|all.time/],
   ['dip', /dip|bounce|oversold|cheap|discount/], ['momentum', /momentum|trend|running|pumping|ripping/], ['fomo', /fomo|everyone|missing|can'?t miss|moon/],
   ['revenge', /revenge|win it back|make it back|recover|get back/], ['overextended', /overextended|too high|top|exhausted|overbought/]];
-
 const TAG_NAMES = TAGS.map(([n]) => n);
+
 function parseThesis(text: string): Thesis {
   const t = text.toLowerCase();
   const sell = /\b(short|sell|bear|dump|fade|drop)\b/.test(t), buy = /\b(long|buy|bull|pump|ape)\b/.test(t);
@@ -329,8 +346,8 @@ function premortem(text: string, m: Market, tiltReasons: string[], parsed?: Thes
   if (side === 'Sell' && crowdedShort) ch.push({ kind: 'funding', text: `Crowded short on ${crowdedShort} of ${nv} venues`, strength: Math.min(0.85, 0.6 + 0.1 * (crowdedShort - 1)) });
   if (side === 'Buy' && ind.fast < ind.slow) ch.push({ kind: 'trend', text: 'Trend is down (EMA9 < EMA21)', strength: 0.6 });
   if (side === 'Sell' && ind.fast > ind.slow) ch.push({ kind: 'trend', text: 'Trend is up (EMA9 > EMA21)', strength: 0.6 });
-  if (side === 'Buy' && ind.rsi > 70) ch.push({ kind: 'rsi', text: `Overbought, RSI ${ind.rsi.toFixed(0)}`, strength: 0.65 });
-  if (side === 'Sell' && ind.rsi < 30) ch.push({ kind: 'rsi', text: `Oversold, RSI ${ind.rsi.toFixed(0)}`, strength: 0.65 });
+  if (side === 'Buy' && ind.r > 70) ch.push({ kind: 'rsi', text: `Overbought, RSI ${ind.r.toFixed(0)}`, strength: 0.65 });
+  if (side === 'Sell' && ind.r < 30) ch.push({ kind: 'rsi', text: `Oversold, RSI ${ind.r.toFixed(0)}`, strength: 0.65 });
   if (ind.atrPct > 0.35) ch.push({ kind: 'vol', text: `Wild market, vol ${ind.atrPct.toFixed(2)}%`, strength: 0.5 });
   if (['fomo', 'revenge'].includes(tag)) ch.push({ kind: 'bias', text: `"${tag}" is a bias, not a reason`, strength: 0.75 });
   if (side) {
@@ -354,24 +371,12 @@ function premortem(text: string, m: Market, tiltReasons: string[], parsed?: Thes
   const top = ch[0]?.strength ?? 0;
   const verdict: Verdict = top >= 0.7 ? 'RED' : top >= 0.4 ? 'AMBER' : 'GREEN';
   const qty = +(cap * (verdict === 'RED' ? 0.3 : 0.6)).toFixed(4);
-  return { thesis: text, symbol: th.symbol, side, tags: th.tags, qty, price: m.price, challenges: ch.slice(0, 3), support: pro.slice(0, 2), verdict, stop, target, stopPct, rr,
-    venues: m.venues, history: hist, tilt: tiltReasons, series: m.closes.slice(-60), mode: MODE, ts: Date.now(),
+  return { thesis: text, symbol: th.symbol, side, tags: th.tags, qty, price: m.price, challenges: ch.slice(0, 3), support: pro.slice(0, 2), verdict, stop, target, stopPct, rr, venues: m.venues, history: hist,
+    tilt: tiltReasons, series: m.closes.slice(-60), mode: MODE, ts: Date.now(),
     summary: side ? `${side === 'Buy' ? 'LONG' : 'SHORT'} ${th.symbol.replace('USDT', '')} ${qty}` : 'Say long or short' };
 }
 
-// ---------- guarded orders ----------
-interface Entry { side: Side; price: number; ts: number }
-const state: { orders: (OrderRequest & { ts: number })[]; lastEntry: Entry | null; tiltForced: boolean } = { orders: [], lastEntry: null, tiltForced: false };
-
-async function bybitOrder(o: Pick<OrderRequest, 'symbol' | 'side' | 'qty'>, reduceOnly = false): Promise<{ retCode: number; retMsg: string }> {
-  if (!KEY || !SECRET) throw new Error('Bybit keys not set');
-  const body = JSON.stringify({ category: 'linear', symbol: o.symbol, side: o.side, orderType: 'Market', qty: String(o.qty), ...(reduceOnly ? { reduceOnly: true } : {}) });
-  const ts = String(Date.now()), rw = '5000';
-  const sig = crypto.createHmac('sha256', SECRET).update(ts + KEY + rw + body).digest('hex');
-  return getJson(`${BYBIT}/v5/order/create`, { method: 'POST', body, headers: {
-    'Content-Type': 'application/json', 'X-BAPI-API-KEY': KEY, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': rw, 'X-BAPI-SIGN': sig } });
-}
-
+// ---------- guarded order execution ----------
 async function executeOrder(o: OrderRequest): Promise<OrderResult> {
   if (!isPair(o.symbol)) return { ok: false, status: 400, error: 'unknown symbol' };
   const cap = MAX_QTY[o.symbol];
@@ -386,8 +391,91 @@ async function executeOrder(o: OrderRequest): Promise<OrderResult> {
   const target = tp !== undefined && (o.side === 'Buy' ? tp > m.price : tp < m.price) ? tp : undefined;
   journal.push({ id: 'j' + Date.now(), ts: Date.now(), text: o.thesis || 'swarm idea', symbol: o.symbol, side: o.side, qty: o.qty, tags: o.tags?.length ? o.tags : ['swarm'], entry: m.price, status: 'open', stop, target });
   saveJournal();
-  return { ok: r.retCode === 0, mode: MODE, fillPrice: m.price, msg: r.retMsg };
+  const out: OrderResult = { ok: r.retCode === 0, mode: MODE, fillPrice: m.price, msg: r.retMsg };
+  tgNotify(`${out.ok ? '✅ Filled' : '❌ Failed'} ${o.side} ${o.qty} ${o.symbol} @ ${m.price} (${MODE})`);
+  return out;
 }
+
+// ---------- Telegram bot (agent's chat channel + pairing) ----------
+interface TgUpdate {
+  update_id: number;
+  callback_query?: { id: string; data: string; message: { chat: { id: number } } };
+  message?: { text?: string; chat: { id: number } };
+}
+interface Pending { symbol: Pair; side: Side; qty: number; summary: string; thesis?: string; tags?: string[]; stop?: number; target?: number }
+const TG = process.env.TELEGRAM_BOT_TOKEN;
+let tgChat: string | null = process.env.TELEGRAM_CHAT_ID || null;
+const pending = new Map<string, Pending>(); // callback id -> trade waiting for a decision
+const awaitingCalm = new Map<string, Pending>(); // chat id -> trade waiting for "calm"
+
+const tg = <T = unknown>(method: string, body: Record<string, unknown>): Promise<T> =>
+  getJson<T>(`https://api.telegram.org/bot${TG}/${method}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+function tgNotify(text: string, extra: Record<string, unknown> = {}): void {
+  if (TG && tgChat) tg('sendMessage', { chat_id: tgChat, text, ...extra }).catch(() => {});
+}
+const voteTxt = (a: AgentVote): string => (a.name === 'Risk' ? (a.vote ? 'ok' : 'HIGH') : a.vote > 0 ? 'LONG' : a.vote < 0 ? 'SHORT' : 'flat');
+
+function tgProposal(p: Omit<Proposal, 'tilt' | 'mode'>, tiltReasons: string[]): void {
+  if (!TG || !tgChat || !p.side) return;
+  const id = String(p.ts); pending.set(id, { symbol: p.symbol, side: p.side, qty: p.qty, summary: p.summary });
+  const lines = p.agents.map(a => `• ${a.name}: ${voteTxt(a)} — ${a.why}`).join('\n');
+  tgNotify(`🐝 Swarm idea: ${p.summary} @ ${p.price}\n${lines}\n${p.agree}/3 agree, confidence ${p.conf}%` +
+    (tiltReasons.length ? `\n⚠️ Tilt Guard: ${tiltReasons.join(', ')}` : ''),
+    { reply_markup: { inline_keyboard: [[{ text: '✅ Approve', callback_data: 'a:' + id }, { text: '🚫 Veto', callback_data: 'v:' + id }]] } });
+}
+function tgPremortem(pm: PreMortem): void {
+  if (!TG || !tgChat || !pm.side) return;
+  const id = String(pm.ts); pending.set(id, { symbol: pm.symbol, side: pm.side, qty: pm.qty, summary: pm.summary, thesis: pm.thesis, tags: pm.tags, stop: pm.stop, target: pm.target });
+  const icon = { RED: '🔴', AMBER: '🟠', GREEN: '🟢' }[pm.verdict];
+  tgNotify(`🧠 Pre-mortem: "${pm.thesis}"\n${icon} ${pm.verdict} — ${pm.summary} @ ${pm.price}\n` + pm.challenges.map(c => `• ${c.text}`).join('\n') +
+    (pm.stop ? `\nStop ${pm.stop} (-${pm.stopPct}%)${pm.target ? ` · Target ${pm.target}` : ''}${pm.rr ? ` · ${pm.rr}R` : ''}` : '\nNo stop set. Add one, e.g. "stop 2% target 4%"'),
+    { reply_markup: { inline_keyboard: [[{ text: '✅ Trade anyway', callback_data: 'a:' + id }, { text: '🚫 Drop it', callback_data: 'v:' + id }]] } });
+}
+async function tgApprove(chat: string | number, p: Pending, calm: boolean): Promise<void> {
+  const r = await executeOrder({ symbol: p.symbol, side: p.side, qty: p.qty, calm, thesis: p.thesis, tags: p.tags, stop: p.stop, target: p.target });
+  if (r.status === 409) { awaitingCalm.set(String(chat), p); tgNotify('🧘 Tilt Guard is on. Reply "calm" to confirm you are calm, or ignore to skip.'); }
+}
+async function tgLoop(): Promise<void> {
+  let offset = 0;
+  for (;;) {
+    try {
+      const u = await tg<{ result?: TgUpdate[] }>('getUpdates', { offset, timeout: 25 });
+      for (const up of u.result ?? []) {
+        offset = up.update_id + 1;
+        const cb = up.callback_query, msg = up.message;
+        if (cb) {
+          const [k, id = ''] = cb.data.split(':');
+          void tg('answerCallbackQuery', { callback_query_id: cb.id });
+          if (k === 'c' || k === 'x') { // cut half / close from /positions
+            const e = journal.find(j => j.id === id && j.status === 'open');
+            if (e) await closePosition(e, await markPrice(e.symbol), k === 'c' ? 'cut' : 'manual', k === 'c' ? 0.5 : 1);
+            continue;
+          }
+          const p = pending.get(id);
+          if (!p) continue;
+          pending.delete(id);
+          if (k === 'v') tgNotify('🚫 Vetoed ' + p.summary); else await tgApprove(cb.message.chat.id, p, false);
+        } else if (msg?.text) {
+          const chat = String(msg.chat.id), t = msg.text.trim().toLowerCase();
+          if (t.startsWith('/start')) { tgChat = chat; tgNotify(`🐝 Swarmleash paired. Chat id ${chat}. I will post swarm ideas here; approve on the glasses or here.\nSay your trade in plain words (e.g. "long ETH, ETF news") and I will argue back.\nAdd a stop and target to any trade, e.g. "stop 2% target 4%".\nCommands: /idea /positions /edge /journal /status`); }
+          else if (t === '/idea') { const m = await market('ETHUSDT'); const p = propose('ETHUSDT', m); tgProposal(p, tilt(m)); if (!p.side) tgNotify(p.summary); }
+          else if (t === '/positions') {
+            const { positions } = await listPositions();
+            if (!positions.length) tgNotify('No open positions.');
+            for (const p of positions) tgNotify(`${p.side === 'Buy' ? 'LONG' : 'SHORT'} ${p.symbol.replace('USDT', '')} ${p.qty} @ ${p.entry} -> ${p.mark}\n${p.pnlPct >= 0 ? '+' : ''}${p.pnlPct}% (${p.pnlUsd >= 0 ? '+' : ''}$${p.pnlUsd})${p.stop ? `\nStop ${p.stop}` : ''}${p.target ? ` · Target ${p.target}` : ''}`,
+              { reply_markup: { inline_keyboard: [[{ text: 'Cut half', callback_data: 'c:' + p.id }, { text: 'Close', callback_data: 'x:' + p.id }]] } });
+          }
+          else if (t === '/edge') tgNotify(edgeText(edgeReport()));
+          else if (t === '/journal') { const st = journalStats(); tgNotify(st.length ? '📓 Your record:\n' + st.map(x => `• ${x.tag}: ${x.wins}/${x.n} won`).join('\n') : 'No closed trades yet.'); }
+          else if (!t.startsWith('/') && !awaitingCalm.has(chat) && t.length > 6) { const th = await parseSmart(msg.text), m = await market(th.symbol); await settleAuto(); const pm = premortem(msg.text, m, tilt(m), th); if (pm.side) tgPremortem(pm); else tgNotify('Say long or short, e.g. "long ETH, ETF news".'); }
+          else if (t === '/status') tgNotify(`Orders (5 min): ${state.orders.filter(o => Date.now() - o.ts < 3e5).length}. Mode: ${MODE}.`);
+          else if (/calm/.test(t) && awaitingCalm.has(chat)) { const p = awaitingCalm.get(chat); awaitingCalm.delete(chat); if (p) await tgApprove(chat, p, true); }
+        }
+      }
+    } catch { await new Promise(r => setTimeout(r, 3000)); }
+  }
+}
+if (TG) { void tgLoop(); console.log('telegram bot polling' + (tgChat ? '' : ' (send /start to pair)')); }
 
 // ---------- HTTP API ----------
 async function readJson<T>(req: http.IncomingMessage): Promise<T> {
@@ -404,11 +492,13 @@ http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return send(res, 204, {});
   const url = new URL(req.url ?? '/', 'http://x');
   try {
-    if (url.pathname === '/api/proposal') { // the swarm's second opinion on the market right now
+    if (url.pathname === '/api/proposal') {
       const q = url.searchParams.get('symbol');
       const symbol: Pair = isPair(q) ? q : 'ETHUSDT';
       const m = await market(symbol);
-      return send(res, 200, { ...propose(symbol, m), tilt: tilt(m), mode: MODE } satisfies Proposal);
+      const p = propose(symbol, m), tl = tilt(m);
+      if (!url.searchParams.get('quiet')) tgProposal(p, tl);
+      return send(res, 200, { ...p, tilt: tl, mode: MODE } satisfies Proposal);
     }
     if (url.pathname === '/api/order' && req.method === 'POST') {
       const r = await executeOrder(await readJson<OrderRequest>(req));
@@ -418,7 +508,8 @@ http.createServer(async (req, res) => {
       const { text } = await readJson<{ text?: string }>(req);
       if (!text || text.length > 300) return send(res, 400, { error: 'say your trade' });
       const th = await parseSmart(text), m = await market(th.symbol); await settleAuto();
-      return send(res, 200, premortem(text, m, tilt(m), th));
+      const pm = premortem(text, m, tilt(m), th); tgPremortem(pm);
+      return send(res, 200, pm);
     }
     if (url.pathname === '/api/positions') return send(res, 200, await listPositions());
     if (url.pathname === '/api/position/close' && req.method === 'POST') {
@@ -430,13 +521,12 @@ http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, closed });
     }
     if (url.pathname === '/api/edge') return send(res, 200, edgeReport());
-    if (url.pathname === '/api/status') return send(res, 200, { gemini: !!GEMINI, model: geminiWorks, bybit: LIVE_ORDERS, orders5m: state.orders.filter(o => Date.now() - o.ts < 3e5).length });
+    if (url.pathname === '/api/status') return send(res, 200, { gemini: !!GEMINI, model: geminiWorks, telegram: !!TG, paired: !!tgChat, bybit: LIVE_ORDERS, orders5m: state.orders.filter(o => Date.now() - o.ts < 3e5).length });
     if (url.pathname === '/api/journal') {
       await settleAuto();
       return send(res, 200, { entries: journal.slice(-30).reverse(), stats: journalStats() } satisfies JournalResponse);
     }
     if (url.pathname === '/api/journal/seed' && req.method === 'POST') { seedJournal(); return send(res, 200, { ok: true, stats: journalStats() }); }
-    if (url.pathname === '/api/tilt') { state.tiltForced = true; return send(res, 200, { ok: true }); } // demo helper
     if (url.pathname === '/api/stt' && req.method === 'POST') { // glasses mic PCM -> text
       const { pcm } = await readJson<{ pcm?: string }>(req);
       const raw = Buffer.from(pcm ?? '', 'base64');
@@ -456,5 +546,5 @@ http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/tilt') { state.tiltForced = true; return send(res, 200, { ok: true }); } // demo helper
     send(res, 404, { error: 'not found' });
-  } catch (e) { send(res, 500, { error: errMsg(e) }); }
+  } catch (e) { send(res, 500, { error: String(e) }); }
 }).listen(PORT, () => console.log(`swarmleash backend :${PORT} (${LIVE_ORDERS ? 'Bybit testnet orders' : 'paper orders'}, ${GEMINI ? 'Gemini ' + GEMINI_MODEL : 'no Gemini: keyword parser, no glasses voice'})`));
